@@ -44,6 +44,10 @@ def load_settings() -> Settings:
     if ca_bundle is not None and not os.path.isfile(ca_bundle):
         raise SystemExit(f"启动失败: CA_BUNDLE 文件不存在: {ca_bundle}")
 
+    max_concurrency = int(os.getenv("MAX_CONCURRENCY", "64"))
+    if max_concurrency < 1:
+        raise SystemExit("启动失败: MAX_CONCURRENCY 必须 >= 1")
+
     return Settings(
         policy=policy,
         dns_server=os.getenv("DNS_SERVER", "127.0.0.1").strip(),
@@ -55,6 +59,6 @@ def load_settings() -> Settings:
         read_timeout=float(os.getenv("READ_TIMEOUT", "10.0")),
         tls_timeout=float(os.getenv("TLS_TIMEOUT", "8.0")),
         max_redirects=max_redirects,
-        max_concurrency=int(os.getenv("MAX_CONCURRENCY", "64")),
+        max_concurrency=max_concurrency,
         overall_timeout=float(os.getenv("PROBE_OVERALL_TIMEOUT", "30.0")),
     )

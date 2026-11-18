@@ -86,6 +86,15 @@ class TestUrlParsing:
         with pytest.raises(PolicyError, match="userinfo"):
             parse_target("http://user:pass@allowed.demo.test/")
 
+    @pytest.mark.parametrize("url", [
+        "http://a.test:99999/",
+        "http://a.test:abc/",
+    ])
+    def test_invalid_port_is_policy_error(self, url):
+        # 非法端口不能让 ValueError 逃逸到 API 层（会变成 500）
+        with pytest.raises(PolicyError, match="端口"):
+            parse_target(url)
+
     def test_redirect_to_non_http_scheme_detected_later(self):
         from app.probe.http_probe import normalize_redirect
 

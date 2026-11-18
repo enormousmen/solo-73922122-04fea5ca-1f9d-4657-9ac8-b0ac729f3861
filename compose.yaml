@@ -96,7 +96,9 @@ services:
       TLS_TIMEOUT: "8.0"
       READ_TIMEOUT: "10.0"
       MAX_REDIRECTS: "3"
-      MAX_CONCURRENCY: "64"
+      # 总并发名额 2 -> 单目标最多占 1 格，另一个慢目标无法占满全局名额。
+      # 演示时可用 docker compose up -d 覆盖为更大值（N>=2 时单目标上限 N-1）。
+      MAX_CONCURRENCY: "2"
       PROBE_OVERALL_TIMEOUT: "30.0"
     ports:
       - "127.0.0.1:8000:8000"

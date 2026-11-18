@@ -9,17 +9,21 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import threading
+import time
 from contextlib import asynccontextmanager
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.probe import dns_wire
+from app.probe.concurrency import TargetKey
 
 
 class InLoopDns:
     def __init__(self) -> None:
         self.zones: dict[str, list[str]] = {}
+        self.queried_names: list[str] = []
         self._transport = None
 
     def connection_made(self, transport):  # noqa: ANN001
@@ -31,6 +35,7 @@ class InLoopDns:
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
         msg = dns_wire.parse_message(data, require_qr=False)
         q = msg.questions[0]
+        self.queried_names.append(q.qname.lower())
         if q.qname.lower() in self.zones:
             reply = dns_wire.build_response(msg.qid, q, answers=self.zones[q.qname.lower()])
         else:
@@ -46,6 +51,17 @@ class InLoopHttp:
         self.requests: list[dict] = []
         self._server = None
         self.port = 0
+        self._gates: dict[tuple[str, str], tuple[asyncio.Event, asyncio.Event]] = {}
+        self._delays: dict[tuple[str, str], float] = {}
+
+    def gate(self, host, path):  # noqa: ANN001
+        arrived = asyncio.Event()
+        release = asyncio.Event()
+        self._gates[(host.lower(), path)] = (arrived, release)
+        return arrived, release
+
+    def delay(self, host, path, seconds):  # noqa: ANN001
+        self._delays[(host.lower(), path)] = seconds
 
     def route(self, host, path, status=200, headers=None, body="ok"):  # noqa: ANN001
         self.routes[(host.lower(), path)] = (status, headers or {}, body)
@@ -66,6 +82,14 @@ class InLoopHttp:
             host = headers.get("host", "").split(":")[0].lower()
             self.requests.append({"method": method, "host": host, "path": path})
             status, extra, body = self.routes.get((host, path), (404, {}, "nf"))
+            delay = self._delays.get((host, path))
+            if delay:
+                await asyncio.sleep(delay)
+            gate = self._gates.get((host, path))
+            if gate is not None:
+                arrived, release = gate
+                arrived.set()
+                await release.wait()
             head = [
                 f"HTTP/1.1 {status} X\r\n",
                 f"Content-Length: {len(body)}\r\n",
@@ -123,6 +147,7 @@ def client(monkeypatch, demo_certs):
         monkeypatch.setenv("READ_TIMEOUT", "5.0")
         monkeypatch.setenv("TLS_TIMEOUT", "5.0")
         monkeypatch.setenv("PROBE_OVERALL_TIMEOUT", "15.0")
+        monkeypatch.setenv("MAX_CONCURRENCY", "2")
 
         import app.probe.config as config_mod
         import app.probe.dns_client as dns_client_mod
@@ -156,6 +181,9 @@ def test_policy_endpoint(client):
     assert body["ip_versions"] == ["IPv4"]
     assert body["max_redirects"] == 3
     assert body["tls_verify"] is True
+    assert body["concurrency"]["total_slots"] == 2
+    assert body["concurrency"]["per_target_slots"] == 1
+    assert body["concurrency"]["in_use"] == 0
 
 
 def test_probe_ok(client):
@@ -212,3 +240,128 @@ def test_probe_bad_method_422(client):
 def test_openapi_docs_available(client):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
+
+
+def test_target_slot_exhausted_returns_429_immediately(client):
+    """总名额 2（单目标 1）：慢目标在飞时同目标第 2 个请求立即 429。"""
+    port = client._http.port
+    client._dns.zones = {"api-slow.test": ["127.0.0.1"]}
+    client._http.delay("api-slow.test", "/slow", 1.0)
+    client._http.route("api-slow.test", "/slow")
+    url = f"http://api-slow.test:{port}/slow"
+
+    results: dict[str, object] = {}
+
+    def slow_request():
+        results["slow"] = client.post("/api/v1/probe", json={"url": url})
+
+    worker = threading.Thread(target=slow_request)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not any(
+            r["host"] == "api-slow.test" for r in client._http.requests
+        ):
+            assert time.monotonic() < deadline, "慢请求未进入目标"
+            time.sleep(0.01)
+        started = time.monotonic()
+        busy = client.post("/api/v1/probe", json={"url": url})
+        elapsed = time.monotonic() - started
+        assert busy.status_code == 429
+        assert elapsed < 0.5
+        detail = busy.json()["detail"]
+        assert detail["target"] == f"api-slow.test:{port}"
+        assert detail["hops"] == []  # 入口即拒，无任何流量
+        assert detail["concurrency"]["per_target_slots"] == 1
+    finally:
+        worker.join(timeout=5)
+    assert results["slow"].status_code == 200
+
+
+def test_redirect_rejection_429_keeps_completed_hops(client):
+    """跳转目标名额已满：429 中保留第 1 跳的请求/响应，第 2 跳零流量。"""
+    port = client._http.port
+    client._dns.zones = {"api-start.test": ["127.0.0.1"]}
+    client._http.route(
+        "api-start.test", "/go",
+        status=302, headers={"Location": "http://api-busy.test/next"},
+    )
+    # 预占 api-busy.test 的唯一单目标名额（模拟另一个在飞探测）
+    import app.probe.main as main_mod
+
+    limiter = main_mod.probe_slots
+    busy_target = TargetKey.from_parts("api-busy.test", 80)
+    assert limiter.acquire(busy_target).granted
+    try:
+        r = client.post(
+            "/api/v1/probe",
+            json={"url": f"http://api-start.test:{port}/go"},
+        )
+    finally:
+        limiter.release(busy_target)
+
+    assert r.status_code == 429
+    detail = r.json()["detail"]
+    assert detail["target"] == "api-busy.test:80"
+    hops = detail["hops"]
+    assert [h["outcome"] for h in hops] == ["redirected", "rejected"]
+    assert hops[0]["status_code"] == 302
+    assert hops[0]["request_sent"] is True
+    assert hops[0]["location"] == "http://api-busy.test/next"
+    assert hops[1]["request_sent"] is False
+    assert hops[1]["connected_peer"] is None
+    # 被拒跳从未被解析或连接
+    assert "api-busy.test" not in client._dns.queried_names
+    assert limiter.snapshot()["in_use"] == 0
+
+
+def test_slow_target_does_not_block_other_target(client):
+    """慢目标占满自身名额，但总名额 2 仍留 1 格给其他目标。"""
+    port = client._http.port
+    client._dns.zones = {
+        "api-slow2.test": ["127.0.0.1"],
+        "api-fast.test": ["127.0.0.1"],
+    }
+    client._http.delay("api-slow2.test", "/slow", 1.0)
+    client._http.route("api-slow2.test", "/slow")
+    client._http.route("api-fast.test", "/")
+
+    results: dict[str, object] = {}
+
+    def slow_request():
+        results["slow"] = client.post(
+            "/api/v1/probe",
+            json={"url": f"http://api-slow2.test:{port}/slow"},
+        )
+
+    worker = threading.Thread(target=slow_request)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 3
+        while not any(
+            r["host"] == "api-slow2.test" for r in client._http.requests
+        ):
+            assert time.monotonic() < deadline, "慢请求未进入目标"
+            time.sleep(0.01)
+        fast = client.post(
+            "/api/v1/probe",
+            json={"url": f"http://api-fast.test:{port}/"},
+        )
+        assert fast.status_code == 200
+        assert fast.json()["outcome"] == "ok"
+    finally:
+        worker.join(timeout=5)
+    assert results["slow"].status_code == 200
+
+
+def test_slot_released_after_completion(client):
+    """探测完成后名额归还，同目标可继续探测（不会一直被 429）。"""
+    port = client._http.port
+    client._dns.zones = {"api-repeat.test": ["127.0.0.1"]}
+    client._http.route("api-repeat.test", "/")
+    for _ in range(3):
+        r = client.post(
+            "/api/v1/probe", json={"url": f"http://api-repeat.test:{port}/"}
+        )
+        assert r.status_code == 200
+    assert client.get("/api/v1/policy").json()["concurrency"]["in_use"] == 0

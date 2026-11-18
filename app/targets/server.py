@@ -119,6 +119,34 @@ async def secret():
     return JSONResponse({"message": "禁止网段目标不应被任何探测请求到达"})
 
 
+# 慢目标：/slow?seconds=3 —— 收到请求后挂起指定时长再响应，
+# 用于演示“单个慢目标占满自己的名额、但不能占满全局名额”。
+@app.get("/slow")
+async def slow(seconds: float = 3.0):
+    slept = max(0.0, min(seconds, 60.0))
+    await asyncio.sleep(slept)
+    return JSONResponse(
+        {
+            "message": "慢目标响应完成（用于并发名额演示）",
+            "slept_seconds": slept,
+        }
+    )
+
+
+# 跳转到“慢目标”：用于演示跳转按新目标重新准入（新目标满额 -> 429）。
+# Location 继承请求的 Host 端口，兼容容器内标准端口与本地高位端口演示。
+@app.get("/redirect-slow")
+async def redirect_slow(request: Request, seconds: float = 5.0):
+    host_header = request.headers.get("host", "allowed.demo.test")
+    port = ""
+    if host_header.count(":") == 1:
+        port = ":" + host_header.rsplit(":", 1)[1]
+    return RedirectResponse(
+        url=f"http://www.allowed.demo.test{port}/slow?seconds={seconds}",
+        status_code=302,
+    )
+
+
 def _server_kwargs() -> dict:
     return {
         "app": app,

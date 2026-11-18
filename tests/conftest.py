@@ -56,14 +56,25 @@ class FakeDns:
 
 # ------------------------------------------------------------- HTTP 测试服务
 class FakeHttpServer:
-    """按 (host, path) 返回预置响应的 HTTP/HTTPS 服务器，并记录请求。"""
+    """按 (host, path) 返回预置响应的 HTTP/HTTPS 服务器，并记录请求。
+
+    ``gate(host, path)`` 可为某条路由安装闸门：请求到达时置位 ``arrived``，
+    并在写出响应前等待 ``release``，用于确定性地制造“慢目标”。
+    """
 
     def __init__(self, ssl_ctx: ssl.SSLContext | None = None) -> None:
         self.routes: dict[tuple[str, str], tuple[int, list[tuple[str, str]], str]] = {}
         self.requests: list[dict] = []
         self.ssl_ctx = ssl_ctx
         self._server: asyncio.base_events.Server | None = None
+        self._gates: dict[tuple[str, str], tuple[asyncio.Event, asyncio.Event]] = {}
 
+    def gate(self, host: str, path: str) -> tuple[asyncio.Event, asyncio.Event]:
+        """返回 (arrived, release)；请求到达后由测试决定何时释放响应。"""
+        arrived = asyncio.Event()
+        release = asyncio.Event()
+        self._gates[(host.lower(), path)] = (arrived, release)
+        return arrived, release
     def route(self, host: str, path: str, status: int = 200,
               headers: list[tuple[str, str]] | None = None, body: str = "ok") -> None:
         self.routes[(host.lower(), path)] = (status, headers or [], body)
@@ -87,6 +98,11 @@ class FakeHttpServer:
             status, extra_headers, body = self.routes.get(
                 (host, path), (404, [], "not found")
             )
+            gate = self._gates.get((host, path))
+            if gate is not None:
+                arrived, release = gate
+                arrived.set()
+                await release.wait()
             resp = [f"HTTP/1.1 {status} X\r\n", f"Content-Length: {len(body)}\r\n",
                     "Connection: close\r\n"]
             for k, v in extra_headers:
@@ -182,7 +198,7 @@ def make_prober(fake_dns, demo_certs):
     _cert, _key, cafile = demo_certs
 
     def _factory(allowed=("127.0.0.1/32",), max_redirects: int = 3,
-                 read_timeout: float = 5.0) -> Prober:
+                 read_timeout: float = 5.0, limiter=None) -> Prober:
         settings = Settings(
             policy=AddressPolicy.from_cidrs(list(allowed)),
             dns_server="127.0.0.1",
@@ -206,6 +222,7 @@ def make_prober(fake_dns, demo_certs):
             read_timeout=read_timeout,
             tls_timeout=5.0,
             max_redirects=max_redirects,
+            limiter=limiter,
         )
 
     return _factory

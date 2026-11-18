@@ -1,8 +1,12 @@
 """FastAPI 出站探测 API。
 
 * 全异步实现，慢探测不会阻塞事件循环与其他请求；
-* 并发量由信号量保护，超出立即返回 429，不排队堆积；
-* 单次探测有总超时，超时返回 408 并附带已完成的逐跳信息。
+* 并发名额按“规范化主机名 + 端口”分配：总名额 ``MAX_CONCURRENCY``，
+  ``N >= 2`` 时单目标最多占 ``N - 1``，其余名额始终留给其他目标；
+  满额立即返回 429，不排队堆积；
+* 跳转按新目标重新准入：准入前不解析、不连接下一跳，且不占用旧目标名额
+  等待；被拒时 429 响应保留已完成跳的请求/响应记录；
+* 单次探测有总超时，超时返回 408；取消/超时/TLS 失败都会归还名额。
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from dataclasses import asdict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .concurrency import TargetBusyError, TargetLimiter
 from .config import Settings, load_settings
 from .dns_client import DnsResolver
 from .http_probe import Prober
@@ -58,7 +63,7 @@ class HopReportModel(BaseModel):
     location: str | None = Field(None, description="3xx 响应的 Location 头")
     redirect_count: int
     outcome: str = Field(
-        ..., description="ok | redirected | blocked | error"
+        ..., description="ok | redirected | blocked | error | rejected"
     )
     reject_reason: str | None = Field(None, description="策略拒绝原因（面向白名单调整）")
     error: str | None = Field(None, description="连接/TLS/读取等错误原因")
@@ -85,6 +90,26 @@ class PolicyResponse(BaseModel):
     tls_verify: bool
     ca_bundle: str | None
     timeouts: dict
+    concurrency: dict = Field(
+        ..., description="全局/单目标并发名额配置与当前占用快照"
+    )
+
+
+class BusyDetail(BaseModel):
+    message: str = Field(..., description="429 原因（目标满额或全局满额）")
+    target: str = Field(..., description="触发拒收的规范化目标 host:port")
+    concurrency: dict = Field(..., description="当前并发名额配置与占用快照")
+    hops: list[HopReportModel] = Field(
+        ...,
+        description=(
+            "已完成的逐跳请求/响应记录；入口即被拒时为空列表，"
+            "跳转被拒时包含此前已完成跳及一条 outcome=rejected 的被拒跳"
+        ),
+    )
+
+
+class BusyResponse(BaseModel):
+    detail: BusyDetail
 
 
 settings: Settings = load_settings()
@@ -94,6 +119,7 @@ resolver = DnsResolver(
     timeout=settings.dns_timeout,
     retries=settings.dns_retries,
 )
+probe_slots = TargetLimiter(settings.max_concurrency)
 prober = Prober(
     policy=settings.policy,
     resolver=resolver,
@@ -102,8 +128,19 @@ prober = Prober(
     read_timeout=settings.read_timeout,
     tls_timeout=settings.tls_timeout,
     max_redirects=settings.max_redirects,
+    limiter=probe_slots,
 )
-_semaphore = asyncio.Semaphore(settings.max_concurrency)
+
+
+def _concurrency_limit() -> dict:
+    snap = probe_slots.snapshot()
+    return {
+        "total_slots": probe_slots.total_slots,
+        "per_target_slots": probe_slots.per_target_limit,
+        "target_key": "规范化主机名(小写/去尾点/IDNA/IP 规范文本) + 端口",
+        "in_use": snap["in_use"],
+        "active_targets": snap["targets"],
+    }
 
 
 @asynccontextmanager
@@ -118,7 +155,13 @@ app = FastAPI(
         "提交 HTTP/HTTPS URL，返回逐跳状态、DNS 解析地址、实际连接地址与拒绝原因。"
         "仅支持 IPv4；每跳全部解析地址均在启动时配置的 CIDR 白名单内才会连接；"
         "最多跟随 3 次跳转；被拒目标不会收到任何探测请求；HTTPS 始终按原域名验证证书。"
+        "并发名额按规范化主机名+端口分配：总名额 N>=2 时单目标最多占 N-1，"
+        "满额立即 429；跳转按新目标重新准入。"
     ),
+    openapi_tags=[
+        {"name": "probe", "description": "发起探测；429 表示并发名额满（含跳转目标）"},
+        {"name": "meta", "description": "健康检查、生效策略与并发名额快照"},
+    ],
     lifespan=lifespan,
 )
 
@@ -145,46 +188,65 @@ async def get_policy() -> PolicyResponse:
             "read": settings.read_timeout,
             "overall": settings.overall_timeout,
         },
+        concurrency=_concurrency_limit(),
     )
 
 
-@app.post("/api/v1/probe", response_model=ProbeResponse, tags=["probe"])
+@app.post(
+    "/api/v1/probe",
+    response_model=ProbeResponse,
+    tags=["probe"],
+    responses={
+        408: {"description": "探测总超时"},
+        422: {"description": "非法 URL / 不支持的方法"},
+        429: {
+            "model": BusyResponse,
+            "description": (
+                "并发名额已满（入口目标或跳转新目标），立即拒绝不排队；"
+                "响应保留已完成跳的请求/响应记录"
+            ),
+        },
+    },
+)
 async def create_probe(req: ProbeRequest) -> ProbeResponse:
     method = req.method.upper()
     if method not in ("GET", "HEAD"):
         raise HTTPException(status_code=422, detail="仅支持 GET/HEAD 方法")
 
     started = time.monotonic()
-    # 单事件循环内，locked() 检查与后续 acquire 之间没有 await，判定是原子的
-    if _semaphore.locked():
+    try:
+        hops = await asyncio.wait_for(
+            prober.probe(req.url, method=method),
+            timeout=settings.overall_timeout,
+        )
+    except TargetBusyError as exc:
+        # 名额满（入口或跳转目标）：立即 429，不排队；跳转场景保留
+        # 已完成跳的请求/响应记录
         raise HTTPException(
             status_code=429,
-            detail=(
-                f"探测并发已达上限 {settings.max_concurrency}，"
-                "为避免慢探测互相阻塞，请求被拒绝，请稍后重试"
-            ),
-        )
-
-    async with _semaphore:
-        try:
-            hops = await asyncio.wait_for(
-                prober.probe(req.url, method=method),
-                timeout=settings.overall_timeout,
-            )
-        except PolicyError as exc:
-            # 入口级静态错误（如非法 URL）：未产生任何流量
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except asyncio.TimeoutError:
-            elapsed = int((time.monotonic() - started) * 1000)
-            raise HTTPException(
-                status_code=408,
-                detail={
-                    "message": f"探测总超时（{settings.overall_timeout}s）",
-                    "elapsed_ms": elapsed,
-                },
-            ) from None
+            detail={
+                "message": exc.reason,
+                "target": exc.target,
+                "concurrency": _concurrency_limit(),
+                "hops": [asdict(h) for h in exc.hops],
+            },
+        ) from exc
+    except PolicyError as exc:
+        # 入口级静态错误（如非法 URL）：未产生任何流量
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except asyncio.TimeoutError:
+        elapsed = int((time.monotonic() - started) * 1000)
+        raise HTTPException(
+            status_code=408,
+            detail={
+                "message": f"探测总超时（{settings.overall_timeout}s）",
+                "elapsed_ms": elapsed,
+            },
+        ) from None
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
+    if not hops:
+        raise HTTPException(status_code=500, detail="探测未产生任何跳记录")
     last = hops[-1]
     if last.outcome == "blocked":
         outcome = "blocked"

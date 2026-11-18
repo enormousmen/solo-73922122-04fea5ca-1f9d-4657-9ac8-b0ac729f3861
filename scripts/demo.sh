@@ -81,6 +81,54 @@ probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"
 probe_url "URL 携带 userinfo：拒绝" "http://u:p@allowed.demo.test${HPORT}/"
 
+# 7) 按目标并发名额：慢目标不能占满全局名额
+#    当前 MAX_CONCURRENCY=2 -> 单目标上限 1：
+#      * 慢目标在飞时，同目标第二个请求立即 429；
+#      * 其他目标仍可用剩下的 1 格正常探测。
+echo
+echo "================================================================"
+echo "▶ 并发名额：单个慢目标 vs 其他目标（总名额 2，单目标上限 1）"
+slow_url="http://allowed.demo.test${HPORT}/slow?seconds=6"
+fast_url="http://www.allowed.demo.test${HPORT}/"
+echo "  - 后台启动慢探测: POST ${slow_url}"
+curl -sS -o /tmp/slow-probe.json -w '    slow 请求 HTTP %{http_code}，耗时 %{time_total}s\n' \
+  -X POST "${BASE}/api/v1/probe" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg u "$slow_url" '{url:$u, method:"GET"}')" &
+slow_pid=$!
+
+# 等待慢目标确认在飞（用并发快照判断，避免固定 sleep 的竞态）
+slow_target="allowed.demo.test:${HTTP_PORT:-80}"
+for _ in $(seq 1 100); do
+  if curl -sS "${BASE}/api/v1/policy" \
+      | jq -e --arg t "$slow_target" \
+        '.concurrency.active_targets[$t] >= 1' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+echo "  - 慢目标在飞时，向同一目标再次探测（预期 429，且立即返回）:"
+curl -sS -o /tmp/busy-probe.json -w '    同目标请求 HTTP %{http_code}，耗时 %{time_total}s\n' \
+  -X POST "${BASE}/api/v1/probe" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg u "$slow_url" '{url:$u, method:"GET"}')"
+jq '{detail: .detail.message, target: .detail.target, hops: .detail.hops}' \
+  /tmp/busy-probe.json
+
+echo "  - 同时向另一个目标探测（预期 200，未被慢目标阻塞）:"
+curl -sS -o /tmp/fast-probe.json -w '    其他目标请求 HTTP %{http_code}，耗时 %{time_total}s\n' \
+  -X POST "${BASE}/api/v1/probe" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg u "$fast_url" '{url:$u, method:"GET"}')"
+jq '{outcome, summary, elapsed_ms}' /tmp/fast-probe.json
+
+wait "$slow_pid"
+echo "  - 慢探测最终结果:"
+jq '{outcome, summary, elapsed_ms}' /tmp/slow-probe.json
+echo "  - 当前并发名额快照（完成后应为 0）:"
+curl -sS "${BASE}/api/v1/policy" | jq '.concurrency'
+
 echo
 echo "### 验证禁止目标从未收到探测请求（应返回空列表）:"
 curl -sS "http://127.0.0.1:${TARGET_REQ_PORT}/_requests" \

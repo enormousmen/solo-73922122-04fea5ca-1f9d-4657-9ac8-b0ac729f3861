@@ -118,7 +118,10 @@ def parse_target(url: str) -> tuple[str, str, int | None, str | None, str]:
         raise PolicyError("URL 缺少主机名")
     if " " in host:
         raise PolicyError(f"主机名非法: {host!r}")
-    port = parts.port  # 非法端口会抛 ValueError，统一转成 PolicyError
+    try:
+        port = parts.port  # 非法端口会抛 ValueError，统一转成 PolicyError
+    except ValueError as exc:
+        raise PolicyError(f"URL 端口非法: {exc}") from exc
     return scheme, host, port, parts.username, raw
 
 
